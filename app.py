@@ -1,8 +1,13 @@
 from flask import Flask, render_template, request, jsonify
 import requests, re, time, random
 from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor, wait
+from werkzeug.exceptions import HTTPException, BadRequest
 
 app=Flask(__name__)
+# Return before Gunicorn's default 30-second worker timeout, even if Habbo stalls.
+app.config['CHECK_TIMEOUT'] = 20
+LOOKUP_POOL = ThreadPoolExecutor(max_workers=5)
 API='https://www.habbo.com/api/public/users'
 VALID=re.compile(r'^[A-Za-z0-9._-]{2,15}$')
 WORDS='ace amber angel aqua aura blaze bloom blue bolt breeze brick calm cedar charm cloud coral crow dawn dream dusk echo ember frost glow gold haze ivy jade jazz jinx joy kite lake leaf light lime luna mist moss muse nova ocean olive onyx pearl pine pixel plum rain raven reef rose ruby sage silk sky snow solar spark star stone storm tide true velvet vibe violet wave wild wolf zen'.split()
@@ -46,7 +51,12 @@ def lookup_cached(name,bucket):
     try:
         r=requests.get(API,params={'name':name},timeout=8,headers={'User-Agent':'Bi0zRareHunter/2.0'})
         if r.status_code==200:
-            d=r.json()
+            try:
+                d=r.json()
+            except ValueError:
+                return {'status':'unknown','detail':'Habbo returned invalid JSON'}
+            if not isinstance(d,dict) or not d.get('name'):
+                return {'status':'unknown','detail':'Habbo returned an invalid profile'}
             return {'status':'taken','detail':'Public Habbo profile found','profile':{'name':d.get('name'),'motto':d.get('motto',''),'uniqueId':d.get('uniqueId')}}
         if r.status_code==404:
             return {'status':'unverified','detail':'No public profile found. This can also mean banned/reserved/invisible; registration is not guaranteed.'}
@@ -56,32 +66,80 @@ def lookup_cached(name,bucket):
         return {'status':'unknown','detail':'Habbo request failed'}
 
 def check_names(items):
-    out=[]; bucket=int(time.time()//600)
+    bucket=int(time.time()//600)
+    pending=[]
     for item in items:
         name=item['name']
         if not VALID.fullmatch(name):
-            out.append({**item,'status':'invalid','detail':'Invalid format'}); continue
-        result=lookup_cached(name.lower(),bucket).copy()
+            pending.append(None)
+        else:
+            pending.append(LOOKUP_POOL.submit(lookup_paced,name.lower(),bucket))
+    futures=[f for f in pending if f is not None]
+    done,_=wait(futures,timeout=app.config['CHECK_TIMEOUT'])
+    out=[]
+    for item,future in zip(items,pending):
+        if future is None:
+            result={'status':'invalid','detail':'Invalid format'}
+        elif future in done:
+            result=future.result()
+        else:
+            future.cancel()
+            result={'status':'unknown','detail':'Check timed out before completion. Try this name again.'}
         out.append({**item,**result})
-        time.sleep(.12)
     return out
+
+def lookup_paced(name,bucket):
+    try:
+        return lookup_cached(name,bucket)
+    finally:
+        time.sleep(.12)
+
+def json_body():
+    d=request.get_json()
+    if not isinstance(d,dict):
+        raise BadRequest('Request body must be a JSON object')
+    return d
+
+def integer_option(d,key,default,low,high):
+    value=d.get(key,default)
+    if isinstance(value,bool) or not isinstance(value,(int,str)):
+        raise BadRequest(f'{key} must be an integer')
+    try:
+        return max(low,min(int(value),high))
+    except (ValueError,TypeError):
+        raise BadRequest(f'{key} must be an integer')
+
+@app.errorhandler(HTTPException)
+def http_error(error):
+    if request.path.startswith('/api/'):
+        return jsonify(error=error.description),error.code
+    return error
+
+@app.errorhandler(500)
+def server_error(error):
+    if request.path.startswith('/api/'):
+        return jsonify(error='An unexpected server error occurred. Please try again.'),500
+    return error
 
 @app.get('/')
 def home(): return render_template('index.html')
 
 @app.post('/api/hunt')
 def hunt():
-    d=request.get_json(silent=True) or {}
+    d=json_body()
     cats=d.get('categories') or ['words','names','three','four','clean']
-    limit=max(10,min(int(d.get('limit',100)),250))
-    minimum=max(0,min(int(d.get('minimum',60)),100))
+    if not isinstance(cats,list) or any(not isinstance(c,str) or c not in {'words','names','three','four','clean'} for c in cats):
+        raise BadRequest('categories must be a list of words, names, three, four, clean')
+    limit=integer_option(d,'limit',100,10,250)
+    minimum=integer_option(d,'minimum',60,0,100)
     candidates=generate(cats,limit,minimum)
     return jsonify({'results':check_names(candidates),'generated':len(candidates),'note':'UNVERIFIED means no public profile was found. Banned, reserved or otherwise invisible names can look the same, so it is not proof the name can be registered.'})
 
 @app.post('/api/check')
 def check():
-    d=request.get_json(silent=True) or {}; raw=d.get('names',[])
+    d=json_body(); raw=d.get('names',[])
     if isinstance(raw,str): raw=re.split(r'[\s,]+',raw)
+    if not isinstance(raw,list): raise BadRequest('names must be text or a list')
     seen=set(); items=[]
     for x in raw[:100]:
         x=str(x).strip()
