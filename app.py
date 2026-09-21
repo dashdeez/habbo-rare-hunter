@@ -1,5 +1,7 @@
 from flask import Flask, render_template, request, jsonify
-import requests, re, time, random
+import requests, re, time, random, math, hashlib
+from pathlib import Path
+from email.utils import parsedate_to_datetime
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, wait
 from werkzeug.exceptions import HTTPException, BadRequest
@@ -7,7 +9,11 @@ from werkzeug.exceptions import HTTPException, BadRequest
 app=Flask(__name__)
 # Return before Gunicorn's default 30-second worker timeout, even if Habbo stalls.
 app.config['CHECK_TIMEOUT'] = 20
-LOOKUP_POOL = ThreadPoolExecutor(max_workers=5)
+LOOKUP_POOL = ThreadPoolExecutor(max_workers=1)
+REQUEST_INTERVAL = 1.5
+NEXT_REQUEST = 0
+COOLDOWN_UNTIL = 0
+SCRIPT_VERSION = hashlib.sha256((Path(__file__).parent / "static/app.js").read_bytes()).hexdigest()[:12]
 API='https://www.habbo.com/api/public/users'
 VALID=re.compile(r'^[A-Za-z0-9._-]{2,15}$')
 WORDS='ace amber angel aqua aura blaze bloom blue bolt breeze brick calm cedar charm cloud coral crow dawn dream dusk echo ember frost glow gold haze ivy jade jazz jinx joy kite lake leaf light lime luna mist moss muse nova ocean olive onyx pearl pine pixel plum rain raven reef rose ruby sage silk sky snow solar spark star stone storm tide true velvet vibe violet wave wild wolf zen'.split()
@@ -46,8 +52,17 @@ def generate(categories, limit, minimum):
     out.sort(key=lambda x:(-x['score'],len(x['name']),x['name']))
     return out[:limit]
 
-@lru_cache(maxsize=10000)
-def lookup_cached(name,bucket):
+def rate_limited():
+    seconds=max(1,math.ceil(COOLDOWN_UNTIL-time.monotonic()))
+    return {'status':'unknown','detail':f'Habbo asked us to wait. Resume in {seconds} seconds.', 'retry_after':seconds}
+
+def lookup_remote(name):
+    # All outbound lookups run on one shared worker; never burst in parallel.
+    global NEXT_REQUEST, COOLDOWN_UNTIL
+    if time.monotonic() < COOLDOWN_UNTIL:
+        return rate_limited()
+    time.sleep(max(0,NEXT_REQUEST-time.monotonic()))
+    NEXT_REQUEST=time.monotonic()+REQUEST_INTERVAL
     try:
         r=requests.get(API,params={'name':name},timeout=8,headers={'User-Agent':'Bi0zRareHunter/2.0'})
         if r.status_code==200:
@@ -60,7 +75,18 @@ def lookup_cached(name,bucket):
             return {'status':'taken','detail':'Public Habbo profile found','profile':{'name':d.get('name'),'motto':d.get('motto',''),'uniqueId':d.get('uniqueId')}}
         if r.status_code==404:
             return {'status':'unverified','detail':'No public profile found. This can also mean banned/reserved/invisible; registration is not guaranteed.'}
-        if r.status_code==429: return {'status':'unknown','detail':'Habbo rate limited this check'}
+        if r.status_code==429:
+            retry=r.headers.get('Retry-After','60')
+            try:
+                seconds=float(retry)
+            except (ValueError,TypeError):
+                try:
+                    seconds=parsedate_to_datetime(retry).timestamp()-time.time()
+                except (ValueError,TypeError,OverflowError):
+                    seconds=60
+            if not math.isfinite(seconds): seconds=60
+            COOLDOWN_UNTIL=time.monotonic()+max(60,seconds)
+            return rate_limited()
         return {'status':'unknown','detail':f'Habbo returned HTTP {r.status_code}'}
     except requests.RequestException:
         return {'status':'unknown','detail':'Habbo request failed'}
@@ -88,11 +114,28 @@ def check_names(items):
         out.append({**item,**result})
     return out
 
-def lookup_paced(name,bucket):
+class TransientLookup(Exception):
+    def __init__(self,result):
+        self.result=result
+
+@lru_cache(maxsize=10000)
+def cached_profile(name,bucket):
+    result=lookup_remote(name)
+    if result['status'] not in {'taken','unverified'}:
+        # lru_cache does not cache exceptions: failures are immediately retryable.
+        raise TransientLookup(result)
+    return result
+
+def lookup_cached(name,bucket):
     try:
-        return lookup_cached(name,bucket)
-    finally:
-        time.sleep(.12)
+        return cached_profile(name,bucket)
+    except TransientLookup as error:
+        return error.result
+
+lookup_cached.cache_clear=cached_profile.cache_clear
+
+def lookup_paced(name,bucket):
+    return lookup_cached(name,bucket)
 
 def json_body():
     d=request.get_json()
@@ -122,7 +165,8 @@ def server_error(error):
     return error
 
 @app.get('/')
-def home(): return render_template('index.html')
+def home():
+    return render_template('index.html',script_version=SCRIPT_VERSION),200,{'Cache-Control':'no-store'}
 
 @app.post('/api/hunt')
 def hunt():
@@ -133,7 +177,7 @@ def hunt():
     limit=integer_option(d,'limit',100,10,250)
     minimum=integer_option(d,'minimum',60,0,100)
     candidates=generate(cats,limit,minimum)
-    return jsonify({'results':check_names(candidates),'generated':len(candidates),'note':'UNVERIFIED means no public profile was found. Banned, reserved or otherwise invisible names can look the same, so it is not proof the name can be registered.'})
+    return jsonify({'results':candidates if d.get('generate_only') is True else check_names(candidates),'generated':len(candidates),'note':'UNVERIFIED means no public profile was found. Banned, reserved or otherwise invisible names can look the same, so it is not proof the name can be registered.'})
 
 @app.post('/api/check')
 def check():

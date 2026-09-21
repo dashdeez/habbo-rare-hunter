@@ -10,6 +10,10 @@ class HuntTests(unittest.TestCase):
     def setUp(self):
         self.client = hunter.app.test_client()
         hunter.lookup_cached.cache_clear()
+        for key,value in [('REQUEST_INTERVAL',0),('NEXT_REQUEST',0),('COOLDOWN_UNTIL',0)]:
+            patcher=patch.object(hunter,key,value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_requested_hunt(self):
         with patch.object(hunter, 'lookup_paced', return_value={'status': 'unverified', 'detail': 'No public profile'}):
@@ -66,7 +70,8 @@ class HuntTests(unittest.TestCase):
                  (200, {}, 'unknown')]
         for status, payload, expected in cases:
             hunter.lookup_cached.cache_clear()
-            with patch.object(hunter.requests, 'get', return_value=Mock(status_code=status, json=Mock(return_value=payload))):
+            hunter.COOLDOWN_UNTIL=0
+            with patch.object(hunter.requests, 'get', return_value=Mock(status_code=status, headers={}, json=Mock(return_value=payload))):
                 self.assertEqual(hunter.lookup_cached('ace', 0)['status'], expected)
         hunter.lookup_cached.cache_clear()
         with patch.object(hunter.requests, 'get', return_value=Mock(status_code=200, json=Mock(side_effect=ValueError('invalid json')))):
@@ -74,6 +79,39 @@ class HuntTests(unittest.TestCase):
         hunter.lookup_cached.cache_clear()
         with patch.object(hunter.requests, 'get', side_effect=requests.Timeout):
             self.assertEqual(hunter.lookup_cached('ace', 0)['status'], 'unknown')
+
+    def test_generation_does_not_check_names(self):
+        with patch.object(hunter,'check_names') as check:
+            response=self.client.post('/api/hunt',json={'categories':['words','names','three','four','clean'],'limit':100,'minimum':60,'generate_only':True})
+        check.assert_not_called()
+        self.assertEqual(response.status_code,200)
+        self.assertEqual(len(response.get_json()['results']),100)
+
+    def test_rate_limit_cooldown_and_no_failure_cache(self):
+        response=Mock(status_code=429,headers={'Retry-After':'120'})
+        with patch.object(hunter.requests,'get',return_value=response) as get:
+            result=hunter.lookup_cached('ace',0)
+            self.assertGreaterEqual(result['retry_after'],119)
+            hunter.lookup_cached('ace',0)
+            hunter.lookup_cached('other',0)
+            self.assertEqual(get.call_count,1)
+            hunter.COOLDOWN_UNTIL=0
+            get.return_value=Mock(status_code=404)
+            self.assertEqual(hunter.lookup_cached('ace',0)['status'],'unverified')
+            self.assertEqual(get.call_count,2)
+            hunter.lookup_cached('ace',0)
+            self.assertEqual(get.call_count,2)
+
+    def test_transient_errors_are_not_cached(self):
+        with patch.object(hunter.requests,'get',side_effect=[requests.Timeout,Mock(status_code=404)]) as get:
+            self.assertEqual(hunter.lookup_cached('ace',0)['status'],'unknown')
+            self.assertEqual(hunter.lookup_cached('ace',0)['status'],'unverified')
+            self.assertEqual(get.call_count,2)
+
+    def test_page_versions_script(self):
+        response=self.client.get('/')
+        self.assertEqual(response.headers['Cache-Control'],'no-store')
+        self.assertIn('app.js?v=',response.get_data(as_text=True))
 
     def test_regex_and_manual_split(self):
         with patch.object(hunter, 'lookup_paced', return_value={'status': 'taken', 'detail': 'Found'}):
