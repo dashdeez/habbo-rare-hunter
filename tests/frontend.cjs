@@ -22,7 +22,7 @@ function reply(status,body,type='application/json') {
 }
 const json = obj=>reply(200,JSON.stringify(obj));
 const candidates=Array.from({length:100},(_,i)=>({name:`name${i}`,kind:'word',score:90}));
-const result=name=>({name,kind:'manual',score:50,status:'taken',detail:'Found'});
+const result=name=>({name,kind:'manual',score:50,status:name==='name0'?'taken':'unverified',detail:'Checked'});
 (async()=>{
     element('#limit').value='100';element('#minimum').value='60';
     response=(url,body)=>url.endsWith('/api/hunt')?json({results:candidates}):json({results:[result(body.names[0])]});
@@ -32,6 +32,7 @@ const result=name=>({name,kind:'manual',score:50,status:'taken',detail:'Found'})
     assert.equal(requests[0].url,'https://bi0z-rare-hunter.onrender.com/api/hunt');
     assert.ok(requests.slice(1).every(r=>r.body.names.length===1));
     assert.equal(element('#total').textContent,100);
+    assert.doesNotMatch(element('#results').innerHTML,/>name0</);
     assert.match(element('#results').innerHTML,/>word</);
     assert.match(element('#progress').textContent,/Finished: 100/);
     // Stop at a rate limit without consuming the failed name, then resume it.

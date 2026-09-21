@@ -16,7 +16,7 @@ const assert=require('node:assert/strict');
         await page.route('**/api/check',async route=>{
             const names=route.request().postDataJSON().names;
             assert.equal(names.length,1);checks++;
-            await route.fulfill({json:{results:[rateLimit?{name:names[0],status:'unknown',retry_after:1}:{name:names[0],kind:'manual',score:50,status:'taken',detail:'Found'}]}});
+            await route.fulfill({json:{results:[rateLimit?{name:names[0],status:'unknown',retry_after:1}:{name:names[0],kind:'manual',score:50,status:'unverified',detail:'No public profile'}]}});
         });
         await page.click('#hunt');
         await page.waitForFunction(()=>document.querySelector('#progress').textContent.includes('rate limit'));

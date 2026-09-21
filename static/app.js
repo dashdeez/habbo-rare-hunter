@@ -1,5 +1,6 @@
 let data=[];const $=s=>document.querySelector(s);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function render(){let q=$('#filter').value.toLowerCase();let rows=data.filter(x=>x.name.toLowerCase().includes(q));$('#results').innerHTML=rows.map(x=>`<tr><td><b>${esc(x.name)}</b></td><td>${esc(x.kind)}</td><td><span class="status ${x.status}">${esc(x.status.toUpperCase())}</span></td><td>${x.score}</td><td class="detail">${esc(x.detail||'')}</td></tr>`).join('');$('#total').textContent=data.length;$('#unverified').textContent=data.filter(x=>x.status==='unverified').length;$('#taken').textContent=data.filter(x=>x.status==='taken').length;$('#unknown').textContent=data.filter(x=>!['taken','unverified'].includes(x.status)).length}
+const notTaken = () => data.filter(x => x.status !== 'taken');
+function render(){let q=$('#filter').value.toLowerCase();let rows=notTaken().filter(x=>x.name.toLowerCase().includes(q));$('#results').innerHTML=rows.map(x=>`<tr><td><b>${esc(x.name)}</b></td><td>${esc(x.kind)}</td><td><span class="status ${x.status}">${esc(x.status.toUpperCase())}</span></td><td>${x.score}</td><td class="detail">${esc(x.detail||'')}</td></tr>`).join('');$('#total').textContent=data.length;$('#unverified').textContent=data.filter(x=>x.status==='unverified').length;$('#taken').textContent=data.filter(x=>x.status==='taken').length;$('#unknown').textContent=data.filter(x=>!['taken','unverified'].includes(x.status)).length}
 async function requestJSON(path, body) {
     // Use the page URL, not document.baseURI (which a <base> tag can change).
     let url;
@@ -117,4 +118,4 @@ $('#check').onclick = async () => {
     await drainQueue();
 };
 $('#filter').oninput=render;
-$('#export').onclick=()=>{let rows=[['Username','Type','Status','Score','Detail'],...data.map(x=>[x.name,x.kind,x.status,x.score,x.detail||''])];let csv=rows.map(r=>r.map(v=>'"'+String(v).replaceAll('"','""')+'"').join(',')).join('\n');let a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.download='bi0z-rare-hunt.csv';a.click()};
+$('#export').onclick=()=>{let rows=[['Username','Type','Status','Score','Detail'],...notTaken().map(x=>[x.name,x.kind,x.status,x.score,x.detail||''])];let csv=rows.map(r=>r.map(v=>'"'+String(v).replaceAll('"','""')+'"').join(',')).join('\n');let a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.download='bi0z-rare-hunt.csv';a.click()};
